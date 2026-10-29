@@ -838,6 +838,73 @@ describe("binary plist date object region", () => {
   });
 });
 
+describe("binary plist clone rewrite", () => {
+  /** A sub-millisecond date overlapped by an empty data object, plus data <07>. */
+  const overlappingDateWithSpareObject = () => {
+    const bytes = Buffer.from(
+      buildBinary({
+        ...archive,
+        $objects: [
+          "$null",
+          new Date("2001-01-01T00:00:00.000Z"),
+          Buffer.alloc(0),
+          Buffer.from([7]),
+        ],
+        $top: { root: { UID: 1 } },
+      }),
+    );
+    const date = scanBinaryPlistScalars(bytes).dates[0];
+    if (date === undefined) throw new Error("fixture lost its date");
+    // 0.0005 s encodes 0x40 as its second payload byte: an empty data record.
+    bytes.writeDoubleBE(0.0005, date.payloadOffset);
+    const table = readBinaryPlistObjectTableLayout(bytes);
+    const objectWith = (record: readonly number[]) => {
+      for (let objectId = 0; objectId < table.objectCount; objectId += 1) {
+        const offset = readBinaryPlistObjectOffset(bytes, table, objectId);
+        if (record.every((byte, index) => bytes[offset + index] === byte))
+          return objectId;
+      }
+      throw new Error("fixture lost an object");
+    };
+    const empty = objectWith([0x40]);
+    const spare = objectWith([0x41, 7]);
+    writeBinaryPlistObjectOffset(bytes, table, empty, date.payloadOffset + 1);
+    return { bytes, spare };
+  };
+
+  it("keeps an object stored in the trailer's spare bytes when isolating an overlapping date", () => {
+    const fixture = overlappingDateWithSpareObject();
+    // Run the table into the trailer, then move data <07> into the trailer's
+    // spare bytes after the table. Decoder bounds admit both placements.
+    const bytes = runOffsetTableIntoTrailer(fixture.bytes);
+    const trailer = bytes.length - 32;
+    bytes.set([0x41, 7], trailer + 1);
+    writeBinaryPlistObjectOffset(
+      bytes,
+      readBinaryPlistObjectTableLayout(bytes),
+      fixture.spare,
+      trailer + 1,
+    );
+    const decoded = parseBinary(bytes) as { $objects: unknown[] };
+    expect([...(decoded.$objects[3] as Uint8Array)]).toEqual([7]);
+    const original = Buffer.from(bytes);
+
+    const graph = decodeKeyedArchiveBytes(bytes, {
+      root: "root",
+      offset: 0,
+      limit: 5,
+    });
+
+    expect(graph.objects.map(({ id, value }) => [id, value])).toEqual([
+      [0, "$null"],
+      [1, { $plist_type: "date", iso8601: null }],
+      [2, { $plist_type: "data", base64: "" }],
+      [3, { $plist_type: "data", base64: "Bw==" }],
+    ]);
+    expect(Buffer.compare(bytes, original)).toBe(0);
+  });
+});
+
 describe("XML plist nesting preflight", () => {
   const selection = { offset: 0, limit: 1 };
 
